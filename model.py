@@ -90,6 +90,26 @@ class SVDHead(nn.Module):
         self.reflect[2, 2] = -1
         self.my_iter = torch.ones(1)
 
+    def sinkhorn(self, scores, n_iters):
+        # scores: (bs, k, np)
+        zero_pad = nn.ZeroPad2d((0, 1, 0, 1))
+        # scores: (bs, k+1, np)
+        scores = zero_pad(scores)
+        for i in range(n_iters):
+            # row normalization
+            scores = torch.cat((
+                scores[:, :-1, :] - (torch.logsumexp(scores[:, :-1, :], dim=2, keepdim=True)),
+                scores[:, -1, None, :]),  # Don't normalize last row
+                dim=1)
+            # col normalization
+            scores = torch.cat((
+                scores[:, :, :-1] - (torch.logsumexp(scores[:, :, :-1], dim=1, keepdim=True)),
+                scores[:, :, -1, None]),  # Don't normalize last row
+                dim=2)
+        # (bs, k, np)
+        scores = scores[:, :-1, :-1]
+        return scores
+
     def forward(self, *input):
         src_embedding = input[0]
         tgt_embedding = input[1]
@@ -99,26 +119,27 @@ class SVDHead(nn.Module):
         num_points = tgt.shape[2]
         temperature = input[4].view(batch_size, 1, 1)
         # (bs, k, np)
-        scores = torch.matmul(src_embedding.transpose(2, 1).contiguous(), tgt_embedding)
-        scores = F.softmax(scores, dim=-1)
-        # (bs, 3, np)
-        max_scores = torch.argmax(scores, dim=-1).unsqueeze(1).expand(-1, 3, -1)
-        src_corr = torch.gather(tgt, dim=-1, index=max_scores)
-        # (bs, np, 1)
-        weights = torch.sum(torch.mul(scores, torch.log(scores + 1e-8)), dim=-1, keepdim=True)
-        # (bs, 1, np)
-        weights = weights.transpose(2, 1).contiguous()
-        # (bs, 1, np)
-        weights = - 1 / (weights + 1e-8)
-        # (bs, 1, np)
-        weights_norm = weights / (torch.sum(weights, dim=-1, keepdim=True) + 1e-8)
+        dists = torch.matmul(src_embedding.transpose(2, 1).contiguous(), tgt_embedding) / math.sqrt(d_k)
+        affinity = dists / temperature
+        log_perm_matrix = self.sinkhorn(affinity, n_iters=5)
+        # (bs, k, np)
+        perm_matrix = torch.exp(log_perm_matrix)
+        perm_matrix_norm = perm_matrix / (torch.sum(perm_matrix, dim=2, keepdim=True) + 1e-8)
+        # (bs, 3, k)
+        weighted_tgt = torch.matmul(tgt, perm_matrix_norm.transpose(2, 1).contiguous())
+        # (bs, k, 1)
+        weights = torch.sum(perm_matrix, dim=-1, keepdim=True)
+        # (bs, k, 1)
+        weights_norm = weights / (torch.sum(weights, dim=1, keepdim=True) + 1e-8)
+        # (bs, 1, k)
+        weights_norm = weights_norm.transpose(2, 1).contiguous()
         # (bs, 3, 1)
         src_centroid = torch.sum(torch.mul(src, weights_norm), dim=2, keepdim=True)
-        tgt_centroid = torch.sum(torch.mul(src_corr, weights_norm), dim=2, keepdim=True)
+        tgt_centroid = torch.sum(torch.mul(weighted_tgt, weights_norm), dim=2, keepdim=True)
         src_centered = src - src_centroid
-        src_corr_centered = src_corr - tgt_centroid
+        src_corr_centered = weighted_tgt - tgt_centroid
         src_corr_centered = torch.mul(src_corr_centered, weights_norm)
-        H = torch.matmul(src_centered, src_corr_centered.transpose(2, 1).contiguous()).cpu()+ torch.eye(3) * 1e-8
+        H = torch.matmul(src_centered, src_corr_centered.transpose(2, 1).contiguous()).cpu()
         R = []
         for i in range(src.size(0)):
             try:
@@ -134,7 +155,7 @@ class SVDHead(nn.Module):
             R.append(r)
         R = torch.stack(R, dim=0).cuda()
         t = torch.matmul(-R, src_centroid) + tgt_centroid
-        return R, t.view(batch_size, 3), scores
+        return R, t.view(batch_size, 3), perm_matrix_norm
 
 class MatchNet(nn.Module):
     def __init__(self, args):

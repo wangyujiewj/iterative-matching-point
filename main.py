@@ -68,7 +68,7 @@ def main():
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     np.random.seed(args.seed)
-    _init_(args)
+    #_init_(args)
     if args.dataset == 'ours':
         train_loader = DataLoader(ModelNet40(num_points=args.n_points,
                                              num_subsampled_points=args.n_subsampled_points,

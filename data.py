@@ -25,7 +25,7 @@ def download():
 
 
 def load_data(partition):
-    download()
+    # download()
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     DATA_DIR = os.path.join(BASE_DIR, '../HierarchicalMatching/data')
     all_data = []
